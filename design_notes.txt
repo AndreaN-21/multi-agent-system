@@ -1,0 +1,132 @@
+# Munder Difflin Multi-Agent System — Design Notes
+
+## Architecture Overview
+
+The system uses a **single orchestrator agent** powered by GPT-4o-mini with OpenAI function calling.
+Rather than instantiating separate agent objects, each "agent" role is implemented as a set of tools
+that the orchestrator can invoke in sequence. This follows a **tool-calling agentic loop** pattern.
+
+---
+
+## Agent Roles & Responsibilities
+
+### 1. Orchestrator Agent (GPT-4o-mini with function calling)
+- Receives the customer request (with date)
+- Plans the sequence of operations
+- Calls tools iteratively until the response is complete
+- Generates the final customer-facing quote
+
+The orchestrator merges the logic that would traditionally live in separate agents:
+- **Inventory Agent**: decides when to check stock and trigger restocking
+- **Quoting Agent**: uses historical quotes + discount logic to price items
+- **Order Fulfillment Agent**: records sale transactions after quoting
+
+---
+
+## Tools Available to the Orchestrator
+
+| Tool | Purpose |
+|------|---------|
+| `check_inventory` | Full inventory snapshot with reorder flags |
+| `check_item_stock` | Stock level for a specific item |
+| `get_quote_history` | Historical quotes for similar orders (pricing reference) |
+| `get_delivery_date` | Supplier delivery estimate by quantity |
+| `restock_item` | Order from supplier (records stock_orders transaction) |
+| `fulfill_order` | Record a sale (records sales transaction) |
+| `get_cash_balance` | Current available cash |
+
+---
+
+## Typical Request Flow
+
+```
+Customer Request
+      │
+      ▼
+Orchestrator receives request + date
+      │
+      ├─► check_inventory(date)          # See what we have
+      ├─► get_quote_history([keywords])  # Find similar past quotes
+      │
+      │   For each requested item:
+      ├─► check_item_stock(item, date)   # Verify specific availability
+      ├─► [if low stock] restock_item()  # Order from supplier
+      ├─► get_delivery_date(date, qty)   # Confirm delivery feasibility
+      ├─► fulfill_order(item, qty, price, date)  # Record the sale
+      │
+      ▼
+Generate final quote response with:
+  - Itemized list (qty, price, discount, subtotal)
+  - Total amount
+  - Delivery confirmation
+  - Any unavailable items noted
+```
+
+---
+
+## Discount Logic
+
+Applied by the orchestrator based on total order quantity per item:
+- < 500 units: no discount
+- 500–999 units: 5% discount
+- 1,000–4,999 units: 10% discount
+- ≥ 5,000 units: 15% discount
+
+---
+
+## Item Name Mapping
+
+Customer requests use informal names ("poster board", "printer paper").
+The orchestrator is prompted to map these to exact catalog names:
+- "printer paper" → "A4 paper" or "Standard copy paper"
+- "cardstock" → "Cardstock" or "Heavyweight paper"
+- "glossy paper" → "Glossy paper"
+- Items not in catalog (balloons, A3 paper, tickets) → noted as unavailable
+
+---
+
+## Database Tables Used
+
+- `transactions`: All buys and sells (source of truth for cash & stock)
+- `inventory`: Item catalog with unit prices and min stock levels
+- `quotes`: Historical quote data for pricing reference
+- `quote_requests`: Original customer requests linked to quotes
+
+---
+
+## Key Design Decisions
+
+1. **Single model loop vs. multi-model**: Using one model with multiple tools is simpler,
+   cheaper, and less error-prone than orchestrating multiple model instances via message passing.
+
+2. **Restock before fulfill**: The orchestrator is instructed to restock low-stock items before
+   recording sales, ensuring inventory consistency.
+
+3. **Tool result chaining**: Each tool result feeds into the model's context, allowing it to
+   make informed decisions (e.g., "stock is 50, customer wants 500 → restock first").
+
+4. **Graceful degradation**: Items not in catalog or with no stock are reported as unavailable
+   rather than causing errors.
+
+---
+
+## Evaluation Results Summary
+
+See `test_results.csv` for full run output.
+
+### Strengths
+- Correctly identifies and maps most item names to catalog entries
+- Applies bulk discounts consistently
+- Restocks items when below minimum threshold
+- Provides detailed, professional customer responses
+
+### Areas for Improvement
+- A3/A5 paper sizes are not in catalog — a size-conversion or "closest match" logic could help
+- The LLM occasionally over-restocks; a smarter restock quantity formula would optimize cash use
+- No multi-item bundling discounts (e.g., "buy 3 types of paper, get extra 5% off")
+
+### Suggested Future Improvements
+1. Add A3, A5 paper variants to the catalog
+2. Implement a predictive restock agent that monitors stock trends
+3. Add a negotiation sub-agent that can offer substitute items when requested items are unavailable
+4. Cache quote history embeddings for faster semantic search
