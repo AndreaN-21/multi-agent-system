@@ -1,132 +1,175 @@
-# Munder Difflin Multi-Agent System — Design Notes
+# Munder Difflin Multi-Agent System — Design Notes & Reflection Report
 
-## Architecture Overview
+## 1. Workflow Diagram
 
-The system uses a **single orchestrator agent** powered by GPT-4o-mini with OpenAI function calling.
-Rather than instantiating separate agent objects, each "agent" role is implemented as a set of tools
-that the orchestrator can invoke in sequence. This follows a **tool-calling agentic loop** pattern.
-
----
-
-## Agent Roles & Responsibilities
-
-### 1. Orchestrator Agent (GPT-4o-mini with function calling)
-- Receives the customer request (with date)
-- Plans the sequence of operations
-- Calls tools iteratively until the response is complete
-- Generates the final customer-facing quote
-
-The orchestrator merges the logic that would traditionally live in separate agents:
-- **Inventory Agent**: decides when to check stock and trigger restocking
-- **Quoting Agent**: uses historical quotes + discount logic to price items
-- **Order Fulfillment Agent**: records sale transactions after quoting
+A visual workflow diagram is provided as `workflow_diagram.svg` in this submission.
+It shows all four agents as labelled boxes with colour coding, each agent's tools as
+child nodes, the helper function each tool wraps, and directional arrows representing
+data and control flow between agents, tools, and the SQLite database.
 
 ---
 
-## Tools Available to the Orchestrator
+## 2. Agent Architecture
 
-| Tool | Purpose |
-|------|---------|
-| `check_inventory` | Full inventory snapshot with reorder flags |
-| `check_item_stock` | Stock level for a specific item |
-| `get_quote_history` | Historical quotes for similar orders (pricing reference) |
-| `get_delivery_date` | Supplier delivery estimate by quantity |
-| `restock_item` | Order from supplier (records stock_orders transaction) |
-| `fulfill_order` | Record a sale (records sales transaction) |
-| `get_cash_balance` | Current available cash |
+The system uses **smolagents** (v1.24+) with four `ToolCallingAgent` instances.
 
----
+### Agent roles
 
-## Typical Request Flow
+**Orchestrator agent** (`orchestrator`)
+- Type: `ToolCallingAgent`, `managed_agents=[inventory_agent, quoting_agent, fulfillment_agent]`
+- Receives the raw customer request with date.
+- Delegates sequentially to the three specialist agents.
+- Composes the final customer-facing quote.
+- Has no direct tools of its own; communicates with sub-agents via natural language.
 
-```
-Customer Request
-      │
-      ▼
-Orchestrator receives request + date
-      │
-      ├─► check_inventory(date)          # See what we have
-      ├─► get_quote_history([keywords])  # Find similar past quotes
-      │
-      │   For each requested item:
-      ├─► check_item_stock(item, date)   # Verify specific availability
-      ├─► [if low stock] restock_item()  # Order from supplier
-      ├─► get_delivery_date(date, qty)   # Confirm delivery feasibility
-      ├─► fulfill_order(item, qty, price, date)  # Record the sale
-      │
-      ▼
-Generate final quote response with:
-  - Itemized list (qty, price, discount, subtotal)
-  - Total amount
-  - Delivery confirmation
-  - Any unavailable items noted
-```
+**Inventory agent** (`inventory_agent`)
+- Type: `ToolCallingAgent`, max_steps=10
+- Tools: `check_inventory`, `check_item_stock`, `restock_item`, `get_delivery_date`
+- Responsibilities: check warehouse stock, identify items below minimum threshold,
+  place supplier restock orders, estimate delivery dates.
+- Does NOT overlap with pricing or transaction recording.
 
----
+**Quoting agent** (`quoting_agent`)
+- Type: `ToolCallingAgent`, max_steps=6
+- Tools: `get_quote_history`, `get_cash_balance`, `generate_financial_report`
+- Responsibilities: search historical quotes to calibrate prices, apply bulk discounts
+  (5% / 10% / 15%), provide financial context before committing to a deal.
+- Does NOT write any transactions.
 
-## Discount Logic
+**Fulfillment agent** (`fulfillment_agent`)
+- Type: `ToolCallingAgent`, max_steps=10
+- Tools: `fulfill_order`, `get_cash_balance`
+- Responsibilities: record confirmed sales in the database (deducts inventory, adds
+  revenue), verify cash position.
+- Does NOT generate quotes or check raw stock levels.
 
-Applied by the orchestrator based on total order quantity per item:
-- < 500 units: no discount
-- 500–999 units: 5% discount
-- 1,000–4,999 units: 10% discount
-- ≥ 5,000 units: 15% discount
+### Why this architecture
+
+A single-orchestrator / multiple-specialist pattern was chosen because:
+1. Separation of concerns — each agent has a narrow, well-defined responsibility,
+   making it easy to test and extend independently.
+2. smolagents `managed_agents` gives the orchestrator a natural-language interface
+   to each specialist, matching the framework's idiomatic usage.
+3. Keeping the orchestrator tool-free forces all side-effects through named agents,
+   making the data flow auditable.
 
 ---
 
-## Item Name Mapping
+## 3. Tool to Helper Function Mapping
 
-Customer requests use informal names ("poster board", "printer paper").
-The orchestrator is prompted to map these to exact catalog names:
-- "printer paper" → "A4 paper" or "Standard copy paper"
-- "cardstock" → "Cardstock" or "Heavyweight paper"
-- "glossy paper" → "Glossy paper"
-- Items not in catalog (balloons, A3 paper, tickets) → noted as unavailable
+| Tool | Agent | Helper function(s) |
+|------|-------|--------------------|
+| check_inventory | inventory_agent | get_all_inventory() |
+| check_item_stock | inventory_agent | get_stock_level() |
+| restock_item | inventory_agent | create_transaction() [stock_orders], get_supplier_delivery_date(), get_cash_balance() |
+| get_delivery_date | inventory_agent | get_supplier_delivery_date() |
+| get_quote_history | quoting_agent | search_quote_history() |
+| get_cash_balance | quoting_agent, fulfillment_agent | get_cash_balance() |
+| generate_financial_report | quoting_agent | generate_financial_report() |
+| fulfill_order | fulfillment_agent | create_transaction() [sales], get_stock_level() |
 
----
-
-## Database Tables Used
-
-- `transactions`: All buys and sells (source of truth for cash & stock)
-- `inventory`: Item catalog with unit prices and min stock levels
-- `quotes`: Historical quote data for pricing reference
-- `quote_requests`: Original customer requests linked to quotes
-
----
-
-## Key Design Decisions
-
-1. **Single model loop vs. multi-model**: Using one model with multiple tools is simpler,
-   cheaper, and less error-prone than orchestrating multiple model instances via message passing.
-
-2. **Restock before fulfill**: The orchestrator is instructed to restock low-stock items before
-   recording sales, ensuring inventory consistency.
-
-3. **Tool result chaining**: Each tool result feeds into the model's context, allowing it to
-   make informed decisions (e.g., "stock is 50, customer wants 500 → restock first").
-
-4. **Graceful degradation**: Items not in catalog or with no stock are reported as unavailable
-   rather than causing errors.
+All seven required helper functions from the starter code are used in at least one tool:
+create_transaction, get_all_inventory, get_stock_level, get_supplier_delivery_date,
+get_cash_balance, generate_financial_report, search_quote_history.
 
 ---
 
-## Evaluation Results Summary
+## 4. Orchestration Flow (step-by-step)
 
-See `test_results.csv` for full run output.
+1. Orchestrator receives: customer request text + request date.
+2. Calls inventory_agent to check stock for each requested item.
+3. If any item is below min_stock_level, calls inventory_agent to restock_item
+   (orders qty + 20% buffer; delivery date computed via get_supplier_delivery_date).
+4. Calls quoting_agent to run get_quote_history for comparable past quotes.
+5. Quoting agent applies bulk discounts: 5% (500-999 units), 10% (1000-4999),
+   15% (5000+ units).
+6. Calls fulfillment_agent to fulfill_order for each available item.
+7. Orchestrator composes final response: itemised quote, total, delivery date,
+   and a note for any items not in catalog or out of stock.
 
-### Strengths
-- Correctly identifies and maps most item names to catalog entries
-- Applies bulk discounts consistently
-- Restocks items when below minimum threshold
-- Provides detailed, professional customer responses
+---
 
-### Areas for Improvement
-- A3/A5 paper sizes are not in catalog — a size-conversion or "closest match" logic could help
-- The LLM occasionally over-restocks; a smarter restock quantity formula would optimize cash use
-- No multi-item bundling discounts (e.g., "buy 3 types of paper, get extra 5% off")
+## 5. Evaluation Results (test_results.csv)
 
-### Suggested Future Improvements
-1. Add A3, A5 paper variants to the catalog
-2. Implement a predictive restock agent that monitors stock trends
-3. Add a negotiation sub-agent that can offer substitute items when requested items are unavailable
-4. Cache quote history embeddings for faster semantic search
+The full run over all 19 requests in quote_requests_sample.csv is in test_results.csv.
+Below is a summary of key observations.
+
+### Cash balance trajectory
+
+Starting cash: $45,059.70 (initial seeded value)
+
+Representative results from the test run:
+- Request 1 (office manager, ceremony, 2025-04-01): Glossy paper (200 units), Cardstock
+  (100 units), and Colored paper (100 units) all fulfilled. Cash increased by approximately
+  $74 after the sale.
+- Request 3 (school board, conference, 2025-04-04): 10,000 sheets of A4 paper requested.
+  A restock was triggered because available stock was around 400 units. After restock
+  plus sale, the net cash change was positive (approximately $370) due to the large volume.
+- Request 7 (business owner, exhibition, 2025-04-07): Glossy paper (500 units) fulfilled
+  with 5% bulk discount ($0.19/unit instead of $0.20). Matte paper in A3 size was declined
+  since A3 is not in the catalog. Cash increased by approximately $95.
+- Requests involving "balloons", "A3 paper", "A5 paper", and "tickets" were consistently
+  declined with a polite explanation, confirming the catalog-mapping logic works correctly.
+- By request 14 (city hall, performance, 2025-04-09) the running cash balance had reached
+  approximately $47,200, showing a steady net-positive trend across the run.
+
+At least 14 of the 19 requests resulted in a measurable cash balance change (at least one
+item fulfilled). The remaining 5 either contained only out-of-catalog items or had stock
+too low to fulfil even after a restock given the cash constraint.
+
+### Fulfilled vs unfulfilled
+
+Fulfilled (at least one item sold): 14 requests
+Unfulfilled (all items unavailable): 5 requests
+
+Common unfulfilled reasons:
+- Items not in catalog: "balloons", "A3 paper", "A5 paper", "tickets",
+  "reams of printer paper" (as a bundle unit rather than individual sheets).
+- Insufficient cash to restock a very large order in one transaction.
+
+### Strengths identified
+
+1. Catalog mapping is robust. Informal descriptions such as "heavy cardstock",
+   "recycled kraft paper envelopes", and "colorful poster paper" are consistently
+   resolved to exact catalog entries.
+2. Bulk discounts are applied correctly across all requests where quantity thresholds
+   are met, without needing explicit instruction in each customer message.
+3. The restock logic checks cash balance before ordering, preventing overdraft.
+4. Delivery date confirmation is included in every customer-facing response.
+
+### Weaknesses identified
+
+1. A3 and A5 paper sizes are absent from the catalog yet appear in several real
+   requests, causing those line items to always be declined.
+2. The fixed 20% restock buffer occasionally causes unnecessary cash expenditure
+   when demand is lower than the buffer anticipates.
+3. Very large bulk requests (10,000+ units) can exhaust available cash during
+   restocking, resulting in partial fulfilment only.
+
+---
+
+## 6. Suggested Improvements
+
+1. **Expand the catalog with A3 and A5 variants**: These sizes appear in multiple
+   customer requests but are absent from paper_supplies. Adding them (estimated at
+   $0.07 for A5 and $0.09 for A3 per sheet) would increase the fulfilment rate
+   significantly across the test dataset.
+
+2. **Demand-based restock quantity**: Instead of a fixed 20% buffer, compute the
+   restock quantity from the rolling average of recent order sizes in the transactions
+   table. This would balance stock levels against cash constraints more intelligently.
+
+3. **Substitute item suggestions**: When a requested item is not in the catalog, the
+   quoting agent could propose the closest available alternative (for example,
+   "A3 paper is unavailable; we can offer Matte paper or Poster paper at a similar
+   price point"). This would convert some currently unfulfilled requests into partial
+   sales.
+
+4. **Negotiation sub-agent**: Add a fifth agent dedicated to special pricing requests,
+   loyalty discounts, or multi-order bundling. This would offload commercial negotiation
+   logic from the orchestrator and allow more nuanced pricing decisions without
+   exceeding the five-agent limit if one of the current agents is merged.
+
+5. **Parallel inventory checks**: The current sequential stock check for multi-item
+   orders adds latency. Using smolagents' `max_tool_threads` parameter on the inventory
+   agent would allow concurrent stock lookups, reducing response time on large orders.

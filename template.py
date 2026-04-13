@@ -1,85 +1,94 @@
+"""
+Munder Difflin Paper Company — Multi-Agent System
+==================================================
+Framework: smolagents (v1.24+)
+
+Architecture:
+  OrchestratorAgent (ToolCallingAgent)
+      ├── InventoryAgent  (ToolCallingAgent) — checks stock, triggers restock
+      ├── QuotingAgent    (ToolCallingAgent) — prices items, applies discounts
+      └── FulfillmentAgent (ToolCallingAgent) — records sales transactions
+
+Each worker agent is registered as a managed sub-agent via the
+`managed_agents` parameter, giving the orchestrator a natural-language interface
+to each specialist.
+"""
+
 import pandas as pd
 import numpy as np
 import os
-import json
+import ast
 import time
 import dotenv
-import ast
+from sqlalchemy import create_engine, Engine
 from sqlalchemy.sql import text
 from datetime import datetime, timedelta
 from typing import Dict, List, Union
-from sqlalchemy import create_engine, Engine
-from openai import OpenAI
 
-# Load environment variables
+from smolagents import ToolCallingAgent, Tool, OpenAIServerModel
+
+# ---------------------------------------------------------------------------
+# Environment & DB setup
+# ---------------------------------------------------------------------------
 dotenv.load_dotenv()
 
-# Create an SQLite database
 db_engine = create_engine("sqlite:///munder_difflin.db")
 
-# List containing the different kinds of papers 
 paper_supplies = [
-    # Paper Types (priced per sheet unless specified)
-    {"item_name": "A4 paper",                         "category": "paper",        "unit_price": 0.05},
-    {"item_name": "Letter-sized paper",              "category": "paper",        "unit_price": 0.06},
-    {"item_name": "Cardstock",                        "category": "paper",        "unit_price": 0.15},
-    {"item_name": "Colored paper",                    "category": "paper",        "unit_price": 0.10},
-    {"item_name": "Glossy paper",                     "category": "paper",        "unit_price": 0.20},
-    {"item_name": "Matte paper",                      "category": "paper",        "unit_price": 0.18},
-    {"item_name": "Recycled paper",                   "category": "paper",        "unit_price": 0.08},
-    {"item_name": "Eco-friendly paper",               "category": "paper",        "unit_price": 0.12},
-    {"item_name": "Poster paper",                     "category": "paper",        "unit_price": 0.25},
-    {"item_name": "Banner paper",                     "category": "paper",        "unit_price": 0.30},
-    {"item_name": "Kraft paper",                      "category": "paper",        "unit_price": 0.10},
-    {"item_name": "Construction paper",               "category": "paper",        "unit_price": 0.07},
-    {"item_name": "Wrapping paper",                   "category": "paper",        "unit_price": 0.15},
-    {"item_name": "Glitter paper",                    "category": "paper",        "unit_price": 0.22},
-    {"item_name": "Decorative paper",                 "category": "paper",        "unit_price": 0.18},
-    {"item_name": "Letterhead paper",                 "category": "paper",        "unit_price": 0.12},
-    {"item_name": "Legal-size paper",                 "category": "paper",        "unit_price": 0.08},
-    {"item_name": "Crepe paper",                      "category": "paper",        "unit_price": 0.05},
-    {"item_name": "Photo paper",                      "category": "paper",        "unit_price": 0.25},
-    {"item_name": "Uncoated paper",                   "category": "paper",        "unit_price": 0.06},
-    {"item_name": "Butcher paper",                    "category": "paper",        "unit_price": 0.10},
-    {"item_name": "Heavyweight paper",                "category": "paper",        "unit_price": 0.20},
-    {"item_name": "Standard copy paper",              "category": "paper",        "unit_price": 0.04},
-    {"item_name": "Bright-colored paper",             "category": "paper",        "unit_price": 0.12},
-    {"item_name": "Patterned paper",                  "category": "paper",        "unit_price": 0.15},
-
-    # Product Types (priced per unit)
-    {"item_name": "Paper plates",                     "category": "product",      "unit_price": 0.10},
-    {"item_name": "Paper cups",                       "category": "product",      "unit_price": 0.08},
-    {"item_name": "Paper napkins",                    "category": "product",      "unit_price": 0.02},
-    {"item_name": "Disposable cups",                  "category": "product",      "unit_price": 0.10},
-    {"item_name": "Table covers",                     "category": "product",      "unit_price": 1.50},
-    {"item_name": "Envelopes",                        "category": "product",      "unit_price": 0.05},
-    {"item_name": "Sticky notes",                     "category": "product",      "unit_price": 0.03},
-    {"item_name": "Notepads",                         "category": "product",      "unit_price": 2.00},
-    {"item_name": "Invitation cards",                 "category": "product",      "unit_price": 0.50},
-    {"item_name": "Flyers",                           "category": "product",      "unit_price": 0.15},
-    {"item_name": "Party streamers",                  "category": "product",      "unit_price": 0.05},
-    {"item_name": "Decorative adhesive tape (washi tape)", "category": "product", "unit_price": 0.20},
-    {"item_name": "Paper party bags",                 "category": "product",      "unit_price": 0.25},
-    {"item_name": "Name tags with lanyards",          "category": "product",      "unit_price": 0.75},
-    {"item_name": "Presentation folders",             "category": "product",      "unit_price": 0.50},
-
-    # Large-format items (priced per unit)
-    {"item_name": "Large poster paper (24x36 inches)", "category": "large_format", "unit_price": 1.00},
+    {"item_name": "A4 paper",                              "category": "paper",        "unit_price": 0.05},
+    {"item_name": "Letter-sized paper",                    "category": "paper",        "unit_price": 0.06},
+    {"item_name": "Cardstock",                             "category": "paper",        "unit_price": 0.15},
+    {"item_name": "Colored paper",                         "category": "paper",        "unit_price": 0.10},
+    {"item_name": "Glossy paper",                          "category": "paper",        "unit_price": 0.20},
+    {"item_name": "Matte paper",                           "category": "paper",        "unit_price": 0.18},
+    {"item_name": "Recycled paper",                        "category": "paper",        "unit_price": 0.08},
+    {"item_name": "Eco-friendly paper",                    "category": "paper",        "unit_price": 0.12},
+    {"item_name": "Poster paper",                          "category": "paper",        "unit_price": 0.25},
+    {"item_name": "Banner paper",                          "category": "paper",        "unit_price": 0.30},
+    {"item_name": "Kraft paper",                           "category": "paper",        "unit_price": 0.10},
+    {"item_name": "Construction paper",                    "category": "paper",        "unit_price": 0.07},
+    {"item_name": "Wrapping paper",                        "category": "paper",        "unit_price": 0.15},
+    {"item_name": "Glitter paper",                         "category": "paper",        "unit_price": 0.22},
+    {"item_name": "Decorative paper",                      "category": "paper",        "unit_price": 0.18},
+    {"item_name": "Letterhead paper",                      "category": "paper",        "unit_price": 0.12},
+    {"item_name": "Legal-size paper",                      "category": "paper",        "unit_price": 0.08},
+    {"item_name": "Crepe paper",                           "category": "paper",        "unit_price": 0.05},
+    {"item_name": "Photo paper",                           "category": "paper",        "unit_price": 0.25},
+    {"item_name": "Uncoated paper",                        "category": "paper",        "unit_price": 0.06},
+    {"item_name": "Butcher paper",                         "category": "paper",        "unit_price": 0.10},
+    {"item_name": "Heavyweight paper",                     "category": "paper",        "unit_price": 0.20},
+    {"item_name": "Standard copy paper",                   "category": "paper",        "unit_price": 0.04},
+    {"item_name": "Bright-colored paper",                  "category": "paper",        "unit_price": 0.12},
+    {"item_name": "Patterned paper",                       "category": "paper",        "unit_price": 0.15},
+    {"item_name": "Paper plates",                          "category": "product",      "unit_price": 0.10},
+    {"item_name": "Paper cups",                            "category": "product",      "unit_price": 0.08},
+    {"item_name": "Paper napkins",                         "category": "product",      "unit_price": 0.02},
+    {"item_name": "Disposable cups",                       "category": "product",      "unit_price": 0.10},
+    {"item_name": "Table covers",                          "category": "product",      "unit_price": 1.50},
+    {"item_name": "Envelopes",                             "category": "product",      "unit_price": 0.05},
+    {"item_name": "Sticky notes",                          "category": "product",      "unit_price": 0.03},
+    {"item_name": "Notepads",                              "category": "product",      "unit_price": 2.00},
+    {"item_name": "Invitation cards",                      "category": "product",      "unit_price": 0.50},
+    {"item_name": "Flyers",                                "category": "product",      "unit_price": 0.15},
+    {"item_name": "Party streamers",                       "category": "product",      "unit_price": 0.05},
+    {"item_name": "Decorative adhesive tape (washi tape)", "category": "product",      "unit_price": 0.20},
+    {"item_name": "Paper party bags",                      "category": "product",      "unit_price": 0.25},
+    {"item_name": "Name tags with lanyards",               "category": "product",      "unit_price": 0.75},
+    {"item_name": "Presentation folders",                  "category": "product",      "unit_price": 0.50},
+    {"item_name": "Large poster paper (24x36 inches)",     "category": "large_format", "unit_price": 1.00},
     {"item_name": "Rolls of banner paper (36-inch width)", "category": "large_format", "unit_price": 2.50},
-
-    # Specialty papers
-    {"item_name": "100 lb cover stock",               "category": "specialty",    "unit_price": 0.50},
-    {"item_name": "80 lb text paper",                 "category": "specialty",    "unit_price": 0.40},
-    {"item_name": "250 gsm cardstock",                "category": "specialty",    "unit_price": 0.30},
-    {"item_name": "220 gsm poster paper",             "category": "specialty",    "unit_price": 0.35},
+    {"item_name": "100 lb cover stock",                    "category": "specialty",    "unit_price": 0.50},
+    {"item_name": "80 lb text paper",                      "category": "specialty",    "unit_price": 0.40},
+    {"item_name": "250 gsm cardstock",                     "category": "specialty",    "unit_price": 0.30},
+    {"item_name": "220 gsm poster paper",                  "category": "specialty",    "unit_price": 0.35},
 ]
 
-# Build a lookup dictionary for item prices
 ITEM_PRICE_LOOKUP = {item["item_name"]: item["unit_price"] for item in paper_supplies}
 
-# ============================================================
-# UTILITY / DATABASE FUNCTIONS
-# ============================================================
+
+# ---------------------------------------------------------------------------
+# Database helper functions (from starter code)
+# ---------------------------------------------------------------------------
 
 def generate_sample_inventory(paper_supplies: list, coverage: float = 0.4, seed: int = 137) -> pd.DataFrame:
     """Generate inventory for a specified fraction of items."""
@@ -94,629 +103,606 @@ def generate_sample_inventory(paper_supplies: list, coverage: float = 0.4, seed:
             "category": item["category"],
             "unit_price": item["unit_price"],
             "current_stock": np.random.randint(200, 800),
-            "min_stock_level": np.random.randint(50, 150)
+            "min_stock_level": np.random.randint(50, 150),
         })
     return pd.DataFrame(inventory)
+
 
 def init_database(engine: Engine = None, seed: int = 137) -> Engine:
     """Set up the Munder Difflin database with all required tables and initial records."""
     if engine is None:
         engine = db_engine
     try:
-        transactions_schema = pd.DataFrame({
+        pd.DataFrame({
             "id": [], "item_name": [], "transaction_type": [],
             "units": [], "price": [], "transaction_date": [],
-        })
-        transactions_schema.to_sql("transactions", engine, if_exists="replace", index=False)
+        }).to_sql("transactions", engine, if_exists="replace", index=False)
 
         initial_date = datetime(2025, 1, 1).isoformat()
 
-        quote_requests_df = pd.read_csv("quote_requests.csv")
-        quote_requests_df["id"] = range(1, len(quote_requests_df) + 1)
-        quote_requests_df.to_sql("quote_requests", engine, if_exists="replace", index=False)
+        qr = pd.read_csv("quote_requests.csv")
+        qr["id"] = range(1, len(qr) + 1)
+        qr.to_sql("quote_requests", engine, if_exists="replace", index=False)
 
         quotes_df = pd.read_csv("quotes.csv")
         quotes_df["request_id"] = range(1, len(quotes_df) + 1)
         quotes_df["order_date"] = initial_date
-
         if "request_metadata" in quotes_df.columns:
             quotes_df["request_metadata"] = quotes_df["request_metadata"].apply(
                 lambda x: ast.literal_eval(x) if isinstance(x, str) else x
             )
-            quotes_df["job_type"] = quotes_df["request_metadata"].apply(lambda x: x.get("job_type", ""))
+            quotes_df["job_type"]   = quotes_df["request_metadata"].apply(lambda x: x.get("job_type", ""))
             quotes_df["order_size"] = quotes_df["request_metadata"].apply(lambda x: x.get("order_size", ""))
             quotes_df["event_type"] = quotes_df["request_metadata"].apply(lambda x: x.get("event_type", ""))
+        quotes_df[["request_id", "total_amount", "quote_explanation",
+                   "order_date", "job_type", "order_size", "event_type"]
+                  ].to_sql("quotes", engine, if_exists="replace", index=False)
 
-        quotes_df = quotes_df[[
-            "request_id", "total_amount", "quote_explanation",
-            "order_date", "job_type", "order_size", "event_type"
-        ]]
-        quotes_df.to_sql("quotes", engine, if_exists="replace", index=False)
-
-        inventory_df = generate_sample_inventory(paper_supplies, seed=seed)
-
-        initial_transactions = []
-        initial_transactions.append({
-            "item_name": None, "transaction_type": "sales",
-            "units": None, "price": 50000.0, "transaction_date": initial_date,
-        })
-
-        for _, item in inventory_df.iterrows():
-            initial_transactions.append({
-                "item_name": item["item_name"], "transaction_type": "stock_orders",
-                "units": item["current_stock"],
-                "price": item["current_stock"] * item["unit_price"],
+        inv_df = generate_sample_inventory(paper_supplies, seed=seed)
+        txns = [{"item_name": None, "transaction_type": "sales",
+                 "units": None, "price": 50000.0, "transaction_date": initial_date}]
+        for _, row in inv_df.iterrows():
+            txns.append({
+                "item_name": row["item_name"], "transaction_type": "stock_orders",
+                "units": row["current_stock"],
+                "price": row["current_stock"] * row["unit_price"],
                 "transaction_date": initial_date,
             })
-
-        pd.DataFrame(initial_transactions).to_sql("transactions", engine, if_exists="append", index=False)
-        inventory_df.to_sql("inventory", engine, if_exists="replace", index=False)
-
+        pd.DataFrame(txns).to_sql("transactions", engine, if_exists="append", index=False)
+        inv_df.to_sql("inventory", engine, if_exists="replace", index=False)
         return engine
 
     except Exception as e:
         print(f"Error initializing database: {e}")
         raise
 
+
 def create_transaction(item_name, transaction_type, quantity, price, date):
     """Record a transaction of type 'stock_orders' or 'sales'."""
-    try:
-        date_str = date.isoformat() if isinstance(date, datetime) else date
-        if transaction_type not in {"stock_orders", "sales"}:
-            raise ValueError("Transaction type must be 'stock_orders' or 'sales'")
-        transaction = pd.DataFrame([{
-            "item_name": item_name, "transaction_type": transaction_type,
-            "units": quantity, "price": price, "transaction_date": date_str,
-        }])
-        transaction.to_sql("transactions", db_engine, if_exists="append", index=False)
-        result = pd.read_sql("SELECT last_insert_rowid() as id", db_engine)
-        return int(result.iloc[0]["id"])
-    except Exception as e:
-        print(f"Error creating transaction: {e}")
-        raise
+    date_str = date.isoformat() if isinstance(date, datetime) else date
+    if transaction_type not in {"stock_orders", "sales"}:
+        raise ValueError("transaction_type must be 'stock_orders' or 'sales'")
+    pd.DataFrame([{
+        "item_name": item_name, "transaction_type": transaction_type,
+        "units": quantity, "price": price, "transaction_date": date_str,
+    }]).to_sql("transactions", db_engine, if_exists="append", index=False)
+    result = pd.read_sql("SELECT last_insert_rowid() as id", db_engine)
+    return int(result.iloc[0]["id"])
+
 
 def get_all_inventory(as_of_date: str) -> Dict[str, int]:
     """Retrieve a snapshot of available inventory as of a specific date."""
     query = """
         SELECT item_name,
-            SUM(CASE
-                WHEN transaction_type = 'stock_orders' THEN units
-                WHEN transaction_type = 'sales' THEN -units
-                ELSE 0
-            END) as stock
+            SUM(CASE WHEN transaction_type='stock_orders' THEN units
+                     WHEN transaction_type='sales' THEN -units ELSE 0 END) AS stock
         FROM transactions
-        WHERE item_name IS NOT NULL AND transaction_date <= :as_of_date
+        WHERE item_name IS NOT NULL AND transaction_date <= :d
         GROUP BY item_name HAVING stock > 0
     """
-    result = pd.read_sql(query, db_engine, params={"as_of_date": as_of_date})
+    result = pd.read_sql(query, db_engine, params={"d": as_of_date})
     return dict(zip(result["item_name"], result["stock"]))
+
 
 def get_stock_level(item_name: str, as_of_date) -> pd.DataFrame:
     """Retrieve the stock level of a specific item as of a given date."""
     if isinstance(as_of_date, datetime):
         as_of_date = as_of_date.isoformat()
-    stock_query = """
+    return pd.read_sql("""
         SELECT item_name,
-            COALESCE(SUM(CASE
-                WHEN transaction_type = 'stock_orders' THEN units
-                WHEN transaction_type = 'sales' THEN -units
-                ELSE 0
-            END), 0) AS current_stock
-        FROM transactions
-        WHERE item_name = :item_name AND transaction_date <= :as_of_date
-    """
-    return pd.read_sql(stock_query, db_engine, params={"item_name": item_name, "as_of_date": as_of_date})
+            COALESCE(SUM(CASE WHEN transaction_type='stock_orders' THEN units
+                              WHEN transaction_type='sales' THEN -units ELSE 0 END), 0) AS current_stock
+        FROM transactions WHERE item_name=:n AND transaction_date<=:d
+    """, db_engine, params={"n": item_name, "d": as_of_date})
+
 
 def get_supplier_delivery_date(input_date_str: str, quantity: int) -> str:
     """Estimate the supplier delivery date based on order quantity."""
-    print(f"FUNC (get_supplier_delivery_date): Calculating for qty {quantity} from date string '{input_date_str}'")
     try:
-        input_date_dt = datetime.fromisoformat(input_date_str.split("T")[0])
+        base = datetime.fromisoformat(input_date_str.split("T")[0])
     except (ValueError, TypeError):
-        print(f"WARN (get_supplier_delivery_date): Invalid date format '{input_date_str}', using today as base.")
-        input_date_dt = datetime.now()
-    if quantity <= 10:
-        days = 0
-    elif quantity <= 100:
-        days = 1
-    elif quantity <= 1000:
-        days = 4
-    else:
-        days = 7
-    delivery_date_dt = input_date_dt + timedelta(days=days)
-    return delivery_date_dt.strftime("%Y-%m-%d")
+        base = datetime.now()
+    days = 0 if quantity <= 10 else 1 if quantity <= 100 else 4 if quantity <= 1000 else 7
+    return (base + timedelta(days=days)).strftime("%Y-%m-%d")
+
 
 def get_cash_balance(as_of_date) -> float:
     """Calculate the current cash balance as of a specified date."""
+    if isinstance(as_of_date, datetime):
+        as_of_date = as_of_date.isoformat()
     try:
-        if isinstance(as_of_date, datetime):
-            as_of_date = as_of_date.isoformat()
-        transactions = pd.read_sql(
-            "SELECT * FROM transactions WHERE transaction_date <= :as_of_date",
-            db_engine, params={"as_of_date": as_of_date},
-        )
-        if not transactions.empty:
-            total_sales = transactions.loc[transactions["transaction_type"] == "sales", "price"].sum()
-            total_purchases = transactions.loc[transactions["transaction_type"] == "stock_orders", "price"].sum()
-            return float(total_sales - total_purchases)
+        txns = pd.read_sql(
+            "SELECT * FROM transactions WHERE transaction_date <= :d",
+            db_engine, params={"d": as_of_date})
+        if not txns.empty:
+            return float(
+                txns.loc[txns["transaction_type"] == "sales", "price"].sum() -
+                txns.loc[txns["transaction_type"] == "stock_orders", "price"].sum()
+            )
         return 0.0
-    except Exception as e:
-        print(f"Error getting cash balance: {e}")
+    except Exception:
         return 0.0
+
 
 def generate_financial_report(as_of_date) -> Dict:
     """Generate a complete financial report for the company as of a specific date."""
     if isinstance(as_of_date, datetime):
         as_of_date = as_of_date.isoformat()
     cash = get_cash_balance(as_of_date)
-    inventory_df = pd.read_sql("SELECT * FROM inventory", db_engine)
-    inventory_value = 0.0
-    inventory_summary = []
-    for _, item in inventory_df.iterrows():
-        stock_info = get_stock_level(item["item_name"], as_of_date)
-        stock = stock_info["current_stock"].iloc[0]
-        item_value = stock * item["unit_price"]
-        inventory_value += item_value
-        inventory_summary.append({
-            "item_name": item["item_name"],
-            "stock": stock,
-            "unit_price": item["unit_price"],
-            "value": item_value,
-        })
-    top_sales_query = """
+    inv_df = pd.read_sql("SELECT * FROM inventory", db_engine)
+    inv_value = 0.0
+    inv_summary = []
+    for _, item in inv_df.iterrows():
+        stock = get_stock_level(item["item_name"], as_of_date)["current_stock"].iloc[0]
+        val = stock * item["unit_price"]
+        inv_value += val
+        inv_summary.append({"item_name": item["item_name"], "stock": stock,
+                             "unit_price": item["unit_price"], "value": val})
+    top = pd.read_sql("""
         SELECT item_name, SUM(units) as total_units, SUM(price) as total_revenue
-        FROM transactions
-        WHERE transaction_type = 'sales' AND transaction_date <= :date
+        FROM transactions WHERE transaction_type='sales' AND transaction_date<=:d
         GROUP BY item_name ORDER BY total_revenue DESC LIMIT 5
-    """
-    top_sales = pd.read_sql(top_sales_query, db_engine, params={"date": as_of_date})
-    top_selling_products = top_sales.to_dict(orient="records")
+    """, db_engine, params={"d": as_of_date}).to_dict(orient="records")
     return {
-        "as_of_date": as_of_date,
-        "cash_balance": cash,
-        "inventory_value": inventory_value,
-        "total_assets": cash + inventory_value,
-        "inventory_summary": inventory_summary,
-        "top_selling_products": top_selling_products,
+        "as_of_date": as_of_date, "cash_balance": cash,
+        "inventory_value": inv_value, "total_assets": cash + inv_value,
+        "inventory_summary": inv_summary, "top_selling_products": top,
     }
+
 
 def search_quote_history(search_terms: List[str], limit: int = 5) -> List[Dict]:
     """Retrieve historical quotes matching any of the provided search terms."""
-    conditions = []
-    params = {}
+    conditions, params = [], {}
     for i, term in enumerate(search_terms):
-        param_name = f"term_{i}"
-        conditions.append(
-            f"(LOWER(qr.response) LIKE :{param_name} OR LOWER(q.quote_explanation) LIKE :{param_name})"
-        )
-        params[param_name] = f"%{term.lower()}%"
-    where_clause = " AND ".join(conditions) if conditions else "1=1"
+        k = f"t{i}"
+        conditions.append(f"(LOWER(qr.response) LIKE :{k} OR LOWER(q.quote_explanation) LIKE :{k})")
+        params[k] = f"%{term.lower()}%"
+    where = " AND ".join(conditions) if conditions else "1=1"
     query = f"""
         SELECT qr.response AS original_request, q.total_amount, q.quote_explanation,
-            q.job_type, q.order_size, q.event_type, q.order_date
-        FROM quotes q
-        JOIN quote_requests qr ON q.request_id = qr.id
-        WHERE {where_clause}
-        ORDER BY q.order_date DESC LIMIT {limit}
+               q.job_type, q.order_size, q.event_type, q.order_date
+        FROM quotes q JOIN quote_requests qr ON q.request_id=qr.id
+        WHERE {where} ORDER BY q.order_date DESC LIMIT {limit}
     """
     with db_engine.connect() as conn:
-        result = conn.execute(text(query), params)
-        return [dict(row._mapping) for row in result]
+        return [dict(r._mapping) for r in conn.execute(text(query), params)]
 
 
-# ============================================================
-# MULTI-AGENT SYSTEM
-# ============================================================
+# ===========================================================================
+# SMOLAGENTS TOOL DEFINITIONS
+# Each tool subclasses smolagents.Tool and implements forward().
+# ===========================================================================
 
-# Initialize OpenAI client with the Vocareum proxy
-client = OpenAI(
-    api_key=os.getenv("UDACITY_OPENAI_API_KEY", ""),
-    base_url="https://openai.vocareum.com/v1",
-)
-MODEL = "gpt-4o-mini"
-
-# ---- TOOL IMPLEMENTATIONS ----
-
-def tool_check_inventory(as_of_date: str) -> str:
-    """Returns a JSON summary of current inventory levels."""
-    inventory = get_all_inventory(as_of_date)
-    if not inventory:
-        return json.dumps({"status": "empty", "items": {}})
-    # Also get min_stock levels
-    inv_df = pd.read_sql("SELECT item_name, min_stock_level, unit_price FROM inventory", db_engine)
-    result = {}
-    for item_name, stock in inventory.items():
-        row = inv_df[inv_df["item_name"] == item_name]
-        min_stock = int(row["min_stock_level"].iloc[0]) if not row.empty else 100
-        unit_price = float(row["unit_price"].iloc[0]) if not row.empty else 0.0
-        result[item_name] = {
-            "current_stock": int(stock),
-            "min_stock_level": min_stock,
-            "unit_price": unit_price,
-            "needs_reorder": int(stock) < min_stock
-        }
-    return json.dumps({"status": "ok", "items": result})
-
-def tool_check_item_stock(item_name: str, as_of_date: str) -> str:
-    """Returns the stock level of a specific item."""
-    df = get_stock_level(item_name, as_of_date)
-    stock = int(df["current_stock"].iloc[0]) if not df.empty else 0
-    # Get unit price from inventory
-    inv_df = pd.read_sql(
-        "SELECT unit_price, min_stock_level FROM inventory WHERE item_name = :name",
-        db_engine, params={"name": item_name}
+class CheckInventoryTool(Tool):
+    name = "check_inventory"
+    description = (
+        "Returns current stock levels for ALL items in the warehouse as of a given date. "
+        "Also flags items that are below their minimum stock threshold and need restocking."
     )
-    if inv_df.empty:
-        # Item not in our inventory at all – check paper_supplies master list
-        unit_price = ITEM_PRICE_LOOKUP.get(item_name, None)
-        return json.dumps({
-            "item_name": item_name,
-            "current_stock": stock,
-            "unit_price": unit_price,
-            "in_catalog": unit_price is not None,
-            "min_stock_level": 100
-        })
-    unit_price = float(inv_df["unit_price"].iloc[0])
-    min_stock = int(inv_df["min_stock_level"].iloc[0])
-    return json.dumps({
-        "item_name": item_name,
-        "current_stock": stock,
-        "unit_price": unit_price,
-        "in_catalog": True,
-        "min_stock_level": min_stock
-    })
-
-def tool_get_quote_history(search_terms: List[str]) -> str:
-    """Retrieves similar past quotes to inform pricing decisions."""
-    history = search_quote_history(search_terms, limit=5)
-    if not history:
-        return json.dumps({"status": "no_history", "quotes": []})
-    return json.dumps({"status": "ok", "quotes": history})
-
-def tool_get_delivery_date(request_date: str, quantity: int) -> str:
-    """Estimates supplier delivery date for a given quantity."""
-    delivery_date = get_supplier_delivery_date(request_date, quantity)
-    return json.dumps({"delivery_date": delivery_date, "quantity": quantity})
-
-def tool_restock_item(item_name: str, quantity: int, request_date: str) -> str:
-    """Orders stock from supplier and records the transaction."""
-    # Get the unit price
-    unit_price = ITEM_PRICE_LOOKUP.get(item_name)
-    if unit_price is None:
-        return json.dumps({"status": "error", "message": f"Item '{item_name}' not found in catalog"})
-
-    cash = get_cash_balance(request_date)
-    total_cost = unit_price * quantity
-    if total_cost > cash:
-        # Order what we can afford
-        max_qty = int(cash / unit_price)
-        if max_qty <= 0:
-            return json.dumps({"status": "error", "message": "Insufficient cash to restock"})
-        quantity = max_qty
-        total_cost = unit_price * quantity
-
-    delivery_date = get_supplier_delivery_date(request_date, quantity)
-    tx_id = create_transaction(item_name, "stock_orders", quantity, total_cost, delivery_date)
-    return json.dumps({
-        "status": "ok",
-        "item_name": item_name,
-        "quantity_ordered": quantity,
-        "total_cost": round(total_cost, 2),
-        "delivery_date": delivery_date,
-        "transaction_id": tx_id
-    })
-
-def tool_fulfill_order(item_name: str, quantity: int, unit_price: float, request_date: str) -> str:
-    """Records a sale transaction and deducts from inventory."""
-    # Check available stock
-    df = get_stock_level(item_name, request_date)
-    available = int(df["current_stock"].iloc[0]) if not df.empty else 0
-
-    if available < quantity:
-        return json.dumps({
-            "status": "partial_or_unavailable",
-            "item_name": item_name,
-            "requested": quantity,
-            "available": available,
-            "message": f"Only {available} units available"
-        })
-
-    total_revenue = unit_price * quantity
-    tx_id = create_transaction(item_name, "sales", quantity, total_revenue, request_date)
-    return json.dumps({
-        "status": "ok",
-        "item_name": item_name,
-        "quantity_sold": quantity,
-        "unit_price": round(unit_price, 4),
-        "total_revenue": round(total_revenue, 2),
-        "transaction_id": tx_id
-    })
-
-def tool_get_cash_balance(as_of_date: str) -> str:
-    """Returns the current cash balance."""
-    balance = get_cash_balance(as_of_date)
-    return json.dumps({"cash_balance": round(balance, 2), "as_of_date": as_of_date})
-
-# ---- TOOL SCHEMAS for OpenAI function calling ----
-
-TOOLS_SCHEMA = [
-    {
-        "type": "function",
-        "function": {
-            "name": "check_inventory",
-            "description": "Get a full snapshot of current inventory levels for all items, including which items need restocking.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "as_of_date": {"type": "string", "description": "Date in YYYY-MM-DD format"}
-                },
-                "required": ["as_of_date"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "check_item_stock",
-            "description": "Check the stock level and unit price of a specific item by its exact name.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "item_name": {"type": "string", "description": "Exact item name from the catalog"},
-                    "as_of_date": {"type": "string", "description": "Date in YYYY-MM-DD format"}
-                },
-                "required": ["item_name", "as_of_date"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_quote_history",
-            "description": "Search past quote history for similar orders to inform pricing. Returns similar historical quotes.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "search_terms": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Keywords to search (e.g. item names, event types, job types)"
-                    }
-                },
-                "required": ["search_terms"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_delivery_date",
-            "description": "Estimate when a supplier order would be delivered based on quantity and request date.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "request_date": {"type": "string", "description": "Request date in YYYY-MM-DD"},
-                    "quantity": {"type": "integer", "description": "Number of units to order"}
-                },
-                "required": ["request_date", "quantity"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "restock_item",
-            "description": "Order additional stock from supplier for a specific item. Use this when stock is low.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "item_name": {"type": "string", "description": "Exact item name"},
-                    "quantity": {"type": "integer", "description": "Quantity to order"},
-                    "request_date": {"type": "string", "description": "Date of request YYYY-MM-DD"}
-                },
-                "required": ["item_name", "quantity", "request_date"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "fulfill_order",
-            "description": "Record a sale for an item. This deducts from inventory and adds to revenue.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "item_name": {"type": "string", "description": "Exact item name"},
-                    "quantity": {"type": "integer", "description": "Quantity sold"},
-                    "unit_price": {"type": "number", "description": "Price per unit charged to the customer"},
-                    "request_date": {"type": "string", "description": "Date of sale YYYY-MM-DD"}
-                },
-                "required": ["item_name", "quantity", "unit_price", "request_date"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_cash_balance",
-            "description": "Get the current cash balance as of a given date.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "as_of_date": {"type": "string", "description": "Date in YYYY-MM-DD format"}
-                },
-                "required": ["as_of_date"]
-            }
+    inputs = {
+        "as_of_date": {
+            "type": "string",
+            "description": "Date in YYYY-MM-DD format to check inventory as of."
         }
     }
-]
+    output_type = "string"
 
-# ---- TOOL DISPATCHER ----
+    def forward(self, as_of_date: str) -> str:
+        inventory = get_all_inventory(as_of_date)
+        inv_df = pd.read_sql("SELECT item_name, min_stock_level, unit_price FROM inventory", db_engine)
+        rows = []
+        for item_name, stock in inventory.items():
+            row = inv_df[inv_df["item_name"] == item_name]
+            min_stock = int(row["min_stock_level"].iloc[0]) if not row.empty else 100
+            unit_price = float(row["unit_price"].iloc[0]) if not row.empty else 0.0
+            flag = " [NEEDS RESTOCK]" if int(stock) < min_stock else ""
+            rows.append(f"- {item_name}: {int(stock)} units (min: {min_stock}, price: ${unit_price:.4f}){flag}")
+        if not rows:
+            return "Inventory is empty."
+        return "Inventory as of " + as_of_date + ":\n" + "\n".join(rows)
 
-def dispatch_tool(tool_name: str, args: dict) -> str:
-    """Route tool calls to the correct Python function."""
-    if tool_name == "check_inventory":
-        return tool_check_inventory(**args)
-    elif tool_name == "check_item_stock":
-        return tool_check_item_stock(**args)
-    elif tool_name == "get_quote_history":
-        return tool_get_quote_history(**args)
-    elif tool_name == "get_delivery_date":
-        return tool_get_delivery_date(**args)
-    elif tool_name == "restock_item":
-        return tool_restock_item(**args)
-    elif tool_name == "fulfill_order":
-        return tool_fulfill_order(**args)
-    elif tool_name == "get_cash_balance":
-        return tool_get_cash_balance(**args)
-    else:
-        return json.dumps({"error": f"Unknown tool: {tool_name}"})
 
-# ---- ORCHESTRATOR AGENT ----
+class CheckItemStockTool(Tool):
+    name = "check_item_stock"
+    description = (
+        "Returns the stock level and unit price for a SPECIFIC item by its exact catalog name."
+    )
+    inputs = {
+        "item_name": {
+            "type": "string",
+            "description": "Exact item name as it appears in the product catalog."
+        },
+        "as_of_date": {
+            "type": "string",
+            "description": "Date in YYYY-MM-DD format."
+        }
+    }
+    output_type = "string"
 
-SYSTEM_PROMPT = """You are the orchestrator of Munder Difflin Paper Company's multi-agent system.
-Your job is to handle customer quote requests end-to-end by coordinating these sub-tasks:
+    def forward(self, item_name: str, as_of_date: str) -> str:
+        df = get_stock_level(item_name, as_of_date)
+        stock = int(df["current_stock"].iloc[0]) if not df.empty else 0
+        inv_row = pd.read_sql(
+            "SELECT unit_price, min_stock_level FROM inventory WHERE item_name=:n",
+            db_engine, params={"n": item_name})
+        if inv_row.empty:
+            unit_price = ITEM_PRICE_LOOKUP.get(item_name)
+            if unit_price is None:
+                return f"'{item_name}' is NOT in our catalog and cannot be supplied."
+            return (f"'{item_name}': {stock} units in stock, unit price ${unit_price:.4f}. "
+                    f"Item is in catalog but not yet stocked in warehouse.")
+        up = float(inv_row["unit_price"].iloc[0])
+        ms = int(inv_row["min_stock_level"].iloc[0])
+        status = "NEEDS RESTOCK" if stock < ms else "OK"
+        return (f"'{item_name}': {stock} units in stock, unit price ${up:.4f}, "
+                f"min level {ms} [{status}]")
 
-1. INVENTORY CHECK: Before quoting, check if we have the requested items in stock.
-2. QUOTE GENERATION: Generate competitive quotes using historical data. Apply bulk discounts:
-   - 5% for orders over 500 units
-   - 10% for orders over 1000 units
-   - 15% for orders over 5000 units
-   Use historical quotes to calibrate pricing when available.
-3. RESTOCK: If stock is insufficient, order from supplier BEFORE fulfilling the order.
-4. ORDER FULFILLMENT: Record the sale transaction after the customer agrees to the quote.
 
-IMPORTANT RULES:
-- Always map customer requests to the EXACT item names in our catalog.
-  Known items include: "A4 paper", "Cardstock", "Colored paper", "Glossy paper", "Matte paper",
-  "Recycled paper", "Construction paper", "Poster paper", "Flyers", "Paper napkins",
-  "Paper cups", "Paper plates", "Heavyweight paper", "Standard copy paper", etc.
-- Items NOT in our catalog (e.g. "balloons", "A3 paper", "A5 paper", "tickets") cannot be fulfilled.
-  Politely note they are unavailable and skip them.
-- Only fulfill items if we actually have stock (or have just restocked).
-- Always confirm the delivery date feasibility.
-- Be professional and customer-friendly in your final response.
+class RestockItemTool(Tool):
+    name = "restock_item"
+    description = (
+        "Orders additional stock from the supplier for a specific item. "
+        "Records a stock_orders transaction and returns the estimated delivery date. "
+        "Use this when stock is below the minimum level or insufficient for an order."
+    )
+    inputs = {
+        "item_name": {
+            "type": "string",
+            "description": "Exact item name to restock."
+        },
+        "quantity": {
+            "type": "integer",
+            "description": "Number of units to order from the supplier."
+        },
+        "request_date": {
+            "type": "string",
+            "description": "Date of the restock request in YYYY-MM-DD format."
+        }
+    }
+    output_type = "string"
 
-Your final answer to the customer should:
-1. List each requested item with: availability, unit price, quantity, discount applied, subtotal
-2. State the total order amount
-3. Confirm expected delivery date
-4. Note any items that could not be fulfilled
-"""
+    def forward(self, item_name: str, quantity: int, request_date: str) -> str:
+        unit_price = ITEM_PRICE_LOOKUP.get(item_name)
+        if unit_price is None:
+            return f"Cannot restock '{item_name}': item not found in catalog."
+        cash = get_cash_balance(request_date)
+        total_cost = unit_price * quantity
+        if total_cost > cash:
+            max_qty = int(cash / unit_price)
+            if max_qty <= 0:
+                return f"Insufficient cash (${cash:.2f}) to restock '{item_name}'."
+            quantity = max_qty
+            total_cost = unit_price * quantity
+        delivery_date = get_supplier_delivery_date(request_date, quantity)
+        tx_id = create_transaction(item_name, "stock_orders", quantity, total_cost, delivery_date)
+        return (f"Restocked '{item_name}': {quantity} units ordered, cost ${total_cost:.2f}, "
+                f"delivery by {delivery_date} (tx #{tx_id}).")
 
-def run_orchestrator(customer_request: str, max_iterations: int = 20) -> str:
-    """
-    Run the multi-agent orchestrator for a single customer request.
-    Uses OpenAI function calling in an agentic loop.
-    """
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": customer_request}
-    ]
 
-    for _ in range(max_iterations):
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            tools=TOOLS_SCHEMA,
-            tool_choice="auto",
+class GetDeliveryDateTool(Tool):
+    name = "get_delivery_date"
+    description = (
+        "Estimates the supplier delivery date for a given order quantity and start date. "
+        "Lead times: <=10 units = same day, <=100 = 1 day, <=1000 = 4 days, >1000 = 7 days."
+    )
+    inputs = {
+        "request_date": {
+            "type": "string",
+            "description": "Order start date in YYYY-MM-DD format."
+        },
+        "quantity": {
+            "type": "integer",
+            "description": "Total number of units to order."
+        }
+    }
+    output_type = "string"
+
+    def forward(self, request_date: str, quantity: int) -> str:
+        delivery = get_supplier_delivery_date(request_date, quantity)
+        return f"Estimated delivery for {quantity} units ordered on {request_date}: {delivery}."
+
+
+class GetQuoteHistoryTool(Tool):
+    name = "get_quote_history"
+    description = (
+        "Searches past quote history for similar orders to inform pricing decisions. "
+        "Returns up to 5 historical quotes matching the given keywords."
+    )
+    inputs = {
+        "search_terms": {
+            "type": "string",
+            "description": "Comma-separated keywords to search (e.g. 'glossy,cardstock,ceremony')."
+        }
+    }
+    output_type = "string"
+
+    def forward(self, search_terms: str) -> str:
+        terms = [t.strip() for t in search_terms.split(",") if t.strip()]
+        history = search_quote_history(terms, limit=5)
+        if not history:
+            return "No matching quote history found."
+        lines = ["Relevant past quotes:"]
+        for q in history:
+            lines.append(
+                f"- [{q.get('job_type', '')} / {q.get('event_type', '')}] "
+                f"${q.get('total_amount', 0):.2f} | {q.get('quote_explanation', '')[:120]}"
+            )
+        return "\n".join(lines)
+
+
+class FulfillOrderTool(Tool):
+    name = "fulfill_order"
+    description = (
+        "Records a confirmed sale for one item. Deducts from inventory and adds revenue. "
+        "Call this once per item after quoting and confirming stock availability."
+    )
+    inputs = {
+        "item_name": {
+            "type": "string",
+            "description": "Exact item name being sold."
+        },
+        "quantity": {
+            "type": "integer",
+            "description": "Number of units sold."
+        },
+        "unit_price": {
+            "type": "number",
+            "description": "Final price per unit charged to the customer (after any discounts)."
+        },
+        "sale_date": {
+            "type": "string",
+            "description": "Date of the sale in YYYY-MM-DD format."
+        }
+    }
+    output_type = "string"
+
+    def forward(self, item_name: str, quantity: int, unit_price: float, sale_date: str) -> str:
+        df = get_stock_level(item_name, sale_date)
+        available = int(df["current_stock"].iloc[0]) if not df.empty else 0
+        if available < quantity:
+            return (f"Cannot fulfill '{item_name}': requested {quantity} units "
+                    f"but only {available} available.")
+        total = unit_price * quantity
+        tx_id = create_transaction(item_name, "sales", quantity, total, sale_date)
+        return (f"Sale recorded: {quantity}x '{item_name}' @ ${unit_price:.4f} = "
+                f"${total:.2f} revenue (tx #{tx_id}).")
+
+
+class GetCashBalanceTool(Tool):
+    name = "get_cash_balance"
+    description = "Returns the current cash balance of the company as of a given date."
+    inputs = {
+        "as_of_date": {
+            "type": "string",
+            "description": "Date in YYYY-MM-DD format."
+        }
+    }
+    output_type = "string"
+
+    def forward(self, as_of_date: str) -> str:
+        balance = get_cash_balance(as_of_date)
+        return f"Cash balance as of {as_of_date}: ${balance:.2f}"
+
+
+class GenerateFinancialReportTool(Tool):
+    name = "generate_financial_report"
+    description = (
+        "Generates a full financial snapshot of Munder Difflin as of a given date. "
+        "Returns cash balance, total inventory value, total assets, and the top 5 "
+        "best-selling products. Use this to assess financial health before quoting "
+        "or to confirm the impact of a completed order."
+    )
+    inputs = {
+        "as_of_date": {
+            "type": "string",
+            "description": "Date in YYYY-MM-DD format for the financial snapshot."
+        }
+    }
+    output_type = "string"
+
+    def forward(self, as_of_date: str) -> str:
+        report = generate_financial_report(as_of_date)
+        top = "\n".join(
+            f"  - {p['item_name']}: {p['total_units']} units, ${p['total_revenue']:.2f} revenue"
+            for p in report["top_selling_products"]
+        ) or "  (no sales yet)"
+        return (
+            f"Financial Report as of {as_of_date}:\n"
+            f"  Cash balance   : ${report['cash_balance']:.2f}\n"
+            f"  Inventory value: ${report['inventory_value']:.2f}\n"
+            f"  Total assets   : ${report['total_assets']:.2f}\n"
+            f"Top selling products:\n{top}"
         )
 
-        assistant_message = response.choices[0].message
 
-        # Add assistant message to history
-        messages.append({
-            "role": "assistant",
-            "content": assistant_message.content,
-            "tool_calls": [
-                {
-                    "id": tc.id,
-                    "type": tc.type,
-                    "function": {"name": tc.function.name, "arguments": tc.function.arguments}
-                }
-                for tc in (assistant_message.tool_calls or [])
-            ] if assistant_message.tool_calls else None
-        })
+# ===========================================================================
+# MODEL — OpenAI-compatible proxy provided by Udacity
+# ===========================================================================
 
-        # If no tool calls, we have the final answer
-        if not assistant_message.tool_calls:
-            return assistant_message.content or "Request processed."
+model = OpenAIServerModel(
+    model_id="gpt-4o-mini",
+    api_base="https://openai.vocareum.com/v1",
+    api_key=os.getenv("UDACITY_OPENAI_API_KEY", ""),
+)
 
-        # Execute all tool calls
-        for tool_call in assistant_message.tool_calls:
-            tool_name = tool_call.function.name
-            try:
-                tool_args = json.loads(tool_call.function.arguments)
-            except json.JSONDecodeError:
-                tool_args = {}
+# ===========================================================================
+# AGENT DEFINITIONS
+# ===========================================================================
 
-            print(f"  [TOOL] {tool_name}({tool_args})")
-            tool_result = dispatch_tool(tool_name, tool_args)
-            print(f"  [RESULT] {tool_result[:200]}...")
+# --- Inventory Agent -------------------------------------------------------
+# Responsible for: checking stock levels, triggering restocking when needed,
+# confirming supplier delivery dates.
 
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": tool_result
-            })
+inventory_agent = ToolCallingAgent(
+    tools=[
+        CheckInventoryTool(),
+        CheckItemStockTool(),
+        RestockItemTool(),
+        GetDeliveryDateTool(),
+    ],
+    model=model,
+    name="inventory_agent",
+    description=(
+        "Specialist for warehouse inventory management. "
+        "Can check stock levels for any item, identify items that need restocking, "
+        "place restock orders with the supplier, and estimate delivery dates. "
+        "Call this agent with questions like: 'Is item X available in quantity Y on date Z?', "
+        "'Restock item Y for date Z', 'When will N units of X arrive?'"
+    ),
+    max_steps=10,
+)
 
-    return "Request processed (max iterations reached)."
+# --- Quoting Agent ---------------------------------------------------------
+# Responsible for: retrieving historical quote data, calculating prices,
+# applying bulk discounts based on order quantity.
+
+quoting_agent = ToolCallingAgent(
+    tools=[
+        GetQuoteHistoryTool(),
+        GetCashBalanceTool(),
+        GenerateFinancialReportTool(),
+    ],
+    model=model,
+    name="quoting_agent",
+    description=(
+        "Specialist for pricing and quote generation. "
+        "Searches historical quote data to calibrate competitive prices. "
+        "Applies bulk discounts: 5% for 500-999 units, 10% for 1000-4999 units, "
+        "15% for 5000+ units. "
+        "Call this agent to generate a price quote for a list of items and quantities."
+    ),
+    max_steps=6,
+)
+
+# --- Fulfillment Agent -----------------------------------------------------
+# Responsible for: recording confirmed sale transactions in the database.
+
+fulfillment_agent = ToolCallingAgent(
+    tools=[
+        FulfillOrderTool(),
+        GetCashBalanceTool(),
+    ],
+    model=model,
+    name="fulfillment_agent",
+    description=(
+        "Specialist for order fulfillment. "
+        "Records confirmed sales transactions in the database, updating inventory and revenue. "
+        "Call this agent once a quote is accepted and stock is confirmed, "
+        "passing: item name, quantity, final unit price (after discounts), and sale date."
+    ),
+    max_steps=10,
+)
+
+# --- Orchestrator ----------------------------------------------------------
+# Coordinates the three specialist agents end-to-end for each customer request.
+
+ORCHESTRATOR_INSTRUCTIONS = """
+You are the Munder Difflin Paper Company sales orchestrator.
+For each incoming customer request you MUST follow this workflow in order:
+
+STEP 1 — INVENTORY CHECK
+  Delegate to inventory_agent: check whether each requested item is in stock in
+  the required quantity. If stock is insufficient for any item, ask inventory_agent
+  to restock it first (order at least the requested quantity + 20% buffer).
+
+STEP 2 — QUOTING
+  Delegate to quoting_agent: look up historical quotes for similar items and events,
+  then generate a price for each item. Apply bulk discounts:
+    - 500-999 units: 5% discount
+    - 1000-4999 units: 10% discount
+    - 5000+ units: 15% discount
+
+STEP 3 — FULFILLMENT
+  Delegate to fulfillment_agent: record the sale for each item that can be fulfilled,
+  using the final discounted unit price and the request date.
+
+STEP 4 — FINAL RESPONSE
+  Compose a professional customer-facing response containing:
+  - Each item: quantity, base unit price, discount applied (%), discounted price, subtotal
+  - Total order amount
+  - Expected delivery date
+  - Any items that could NOT be supplied (not in catalog or insufficient stock)
+
+IMPORTANT RULES:
+- Map customer descriptions to EXACT catalog names. Examples:
+    "printer paper" or "A4 white paper"  → "A4 paper" or "Standard copy paper"
+    "glossy paper" / "glossy A4"         → "Glossy paper"
+    "matte paper" / "matte A3"           → "Matte paper"
+    "heavy cardstock" / "cardstock"      → "Cardstock" or "Heavyweight paper"
+    "colored paper" / "assorted colors"  → "Colored paper"
+    "recycled paper" / "eco paper"       → "Recycled paper"
+    "construction paper"                 → "Construction paper"
+    "poster boards" / "24x36 boards"     → "Large poster paper (24x36 inches)"
+    "poster paper"                       → "Poster paper"
+    "streamers"                          → "Party streamers"
+    "washi tape"                         → "Decorative adhesive tape (washi tape)"
+    "napkins" / "table napkins"          → "Paper napkins"
+    "paper cups" / "biodegradable cups"  → "Paper cups"
+    "paper plates" / "biodegradable plates" → "Paper plates"
+    "flyers"                             → "Flyers"
+    "envelopes"                          → "Envelopes"
+- Items NOT in catalog (e.g. "balloons", "A3 paper", "A5 paper", "tickets",
+  "ream of printer paper") cannot be fulfilled — note them politely and skip.
+- Always pass the request date when calling agents.
+- Do not fulfill the same item twice.
+"""
+
+orchestrator = ToolCallingAgent(
+    tools=[],
+    model=model,
+    managed_agents=[inventory_agent, quoting_agent, fulfillment_agent],
+    instructions=ORCHESTRATOR_INSTRUCTIONS,
+    max_steps=25,
+)
 
 
-# ============================================================
+# ===========================================================================
 # TEST SCENARIOS
-# ============================================================
+# ===========================================================================
 
 def run_test_scenarios():
     print("Initializing Database...")
     init_database()
 
     try:
-        quote_requests_sample = pd.read_csv("quote_requests_sample.csv")
-        quote_requests_sample["request_date"] = pd.to_datetime(
-            quote_requests_sample["request_date"], format="%m/%d/%y", errors="coerce"
-        )
-        quote_requests_sample.dropna(subset=["request_date"], inplace=True)
-        quote_requests_sample = quote_requests_sample.sort_values("request_date")
+        sample = pd.read_csv("quote_requests_sample.csv")
+        sample["request_date"] = pd.to_datetime(
+            sample["request_date"], format="%m/%d/%y", errors="coerce")
+        sample.dropna(subset=["request_date"], inplace=True)
+        sample = sample.sort_values("request_date")
     except Exception as e:
         print(f"FATAL: Error loading test data: {e}")
         return
 
-    # Get initial state
-    initial_date = quote_requests_sample["request_date"].min().strftime("%Y-%m-%d")
+    initial_date = sample["request_date"].min().strftime("%Y-%m-%d")
     report = generate_financial_report(initial_date)
     current_cash = report["cash_balance"]
     current_inventory = report["inventory_value"]
 
     results = []
-    for idx, row in quote_requests_sample.iterrows():
+    for idx, row in sample.iterrows():
         request_date = row["request_date"].strftime("%Y-%m-%d")
 
         print(f"\n{'='*60}")
         print(f"=== Request {idx+1} ===")
-        print(f"Context: {row['job']} organizing {row['event']}")
-        print(f"Request Date: {request_date}")
-        print(f"Cash Balance: ${current_cash:.2f}")
-        print(f"Inventory Value: ${current_inventory:.2f}")
+        print(f"Context : {row['job']} organizing {row['event']}")
+        print(f"Date    : {request_date}")
+        print(f"Cash    : ${current_cash:.2f}  |  Inventory: ${current_inventory:.2f}")
 
         request_with_date = f"{row['request']} (Date of request: {request_date})"
-        print(f"Request: {request_with_date[:200]}...")
 
-        # Call the multi-agent system
         try:
-            response = run_orchestrator(request_with_date)
+            response = orchestrator.run(request_with_date)
         except Exception as e:
-            print(f"ERROR processing request: {e}")
+            print(f"ERROR: {e}")
             response = f"Error: {str(e)}"
 
-        # Update state
         report = generate_financial_report(request_date)
         current_cash = report["cash_balance"]
         current_inventory = report["inventory_value"]
 
         print(f"\nResponse: {response}")
-        print(f"Updated Cash: ${current_cash:.2f}")
-        print(f"Updated Inventory: ${current_inventory:.2f}")
+        print(f"Updated Cash: ${current_cash:.2f}  |  Inventory: ${current_inventory:.2f}")
 
         results.append({
             "request_id": idx + 1,
@@ -730,21 +716,20 @@ def run_test_scenarios():
 
         time.sleep(1)
 
-    # Final report
-    final_date = quote_requests_sample["request_date"].max().strftime("%Y-%m-%d")
+    final_date = sample["request_date"].max().strftime("%Y-%m-%d")
     final_report = generate_financial_report(final_date)
     print("\n" + "="*60)
     print("===== FINAL FINANCIAL REPORT =====")
-    print(f"Final Cash: ${final_report['cash_balance']:.2f}")
-    print(f"Final Inventory: ${final_report['inventory_value']:.2f}")
-    print(f"Total Assets: ${final_report['total_assets']:.2f}")
+    print(f"Cash      : ${final_report['cash_balance']:.2f}")
+    print(f"Inventory : ${final_report['inventory_value']:.2f}")
+    print(f"Total     : ${final_report['total_assets']:.2f}")
     print("\nTop Selling Products:")
     for p in final_report["top_selling_products"]:
-        print(f"  - {p.get('item_name', 'N/A')}: {p.get('total_units', 0)} units, ${p.get('total_revenue', 0):.2f} revenue")
+        print(f"  - {p.get('item_name', 'N/A')}: "
+              f"{p.get('total_units', 0)} units, ${p.get('total_revenue', 0):.2f} revenue")
 
-    # Save results
     pd.DataFrame(results).to_csv("test_results.csv", index=False)
-    print("\nResults saved to test_results.csv")
+    print("\nSaved to test_results.csv")
     return results
 
 
