@@ -522,7 +522,7 @@ class GenerateFinancialReportTool(Tool):
 model = OpenAIServerModel(
     model_id="gpt-4o-mini",
     api_base="https://openai.vocareum.com/v1",
-    api_key=os.getenv("UDACITY_OPENAI_API_KEY", ""),
+    api_key=os.getenv("OPENAI_API_KEY", ""),
 )
 
 # ===========================================================================
